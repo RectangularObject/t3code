@@ -1,3 +1,5 @@
+> **Personal fork:** This repository (`RectangularObject/t3code`) is a personal fork of [pingdotgg/t3code](https://github.com/pingdotgg/t3code) tracking upstream nightlies with custom features (such as always-on Plan Mode). See [FORK.md](./FORK.md) for details.
+
 <p align="center">
   <a href="https://t3.codes">
     <img src="./assets/prod/t3-black-web-icon-192x192.png" width="80" height="80" alt="T3 Code logo" />
