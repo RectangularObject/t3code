@@ -209,6 +209,8 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
   followUpBehavior: "queue" | "steer";
   canSteer: boolean;
   alternateShortcutLabel: string | null;
+  showPlanFollowUpPrompt: boolean;
+  promptHasText: boolean;
   voiceInputActive?: boolean;
   isSendBusy: boolean;
   isSendHeld?: boolean;
@@ -222,6 +224,7 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
   onResume: () => void;
   onPreviousPendingQuestion: () => void;
   onInterrupt: () => void;
+  onImplementPlanInNewThread: () => void;
   compactBeforeSendTokens: number | null;
   hideCompactToggle: boolean;
   keepFullHistory: boolean;
@@ -239,6 +242,8 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
         followUpBehavior={props.followUpBehavior}
         canSteer={props.canSteer}
         alternateShortcutLabel={props.alternateShortcutLabel}
+        showPlanFollowUpPrompt={props.showPlanFollowUpPrompt}
+        promptHasText={props.promptHasText}
         voiceInputActive={props.voiceInputActive ?? false}
         isSendBusy={props.isSendBusy}
         isSendHeld={props.isSendHeld ?? false}
@@ -253,6 +258,7 @@ export const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryA
         onResume={props.onResume}
         onPreviousPendingQuestion={props.onPreviousPendingQuestion}
         onInterrupt={props.onInterrupt}
+        onImplementPlanInNewThread={props.onImplementPlanInNewThread}
         compactBeforeSendTokens={props.compactBeforeSendTokens}
         hideCompactToggle={props.hideCompactToggle}
         keepFullHistory={props.keepFullHistory}
