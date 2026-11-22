@@ -1,4 +1,7 @@
+import type { ThreadStructure } from "@t3tools/client-runtime/state/shell";
+import type { OrchestrationV2PlanArtifact, PlanId, RunId } from "@t3tools/contracts";
 import { stripDisplayedPlanMarkdown, proposedPlanTitle } from "@t3tools/shared/proposedPlanText";
+import * as DateTime from "effect/DateTime";
 import { msg } from "gt-react";
 
 import { m, type MessageResolver } from "./i18n/messages";
@@ -75,6 +78,89 @@ function sanitizePlanFileSegment(input: string): string {
 }
 
 export const PLAN_IMPLEMENTATION_PROMPT_PREFIX = "PLEASE IMPLEMENT THIS PLAN:\n";
+
+export interface LatestProposedPlanState {
+  readonly id: PlanId;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly runId: RunId | null;
+  readonly planMarkdown: string;
+  readonly status: OrchestrationV2PlanArtifact["status"];
+}
+
+function planItemTime(
+  projection: ThreadStructure,
+  plan: Pick<OrchestrationV2PlanArtifact, "id" | "runId">,
+): string {
+  const item = projection.turnItems.findLast(
+    (candidate) =>
+      (candidate.type === "proposed_plan" || candidate.type === "todo_list") &&
+      candidate.planId === plan.id,
+  );
+  if (item?.type === "proposed_plan" || item?.type === "todo_list") {
+    return DateTime.formatIso(item.updatedAt);
+  }
+  // Without a plan item, the plan's run dates it; the thread's own timestamps move while a reply streams.
+  const run = projection.runs.find((candidate) => candidate.id === plan.runId);
+  return DateTime.formatIso(
+    run?.completedAt ?? run?.startedAt ?? run?.requestedAt ?? projection.thread.createdAt,
+  );
+}
+
+export function findLatestProposedPlan(
+  projection: ThreadStructure | null,
+  latestRunId: RunId | string | null | undefined,
+): LatestProposedPlanState | null {
+  if (projection === null) return null;
+  const plans = projection.plans.filter((plan) => plan.kind === "proposed_plan");
+  const candidates = latestRunId ? plans.filter((plan) => plan.runId === latestRunId) : plans;
+  const plan = [...(candidates.length > 0 ? candidates : plans)]
+    .toSorted(
+      (left, right) =>
+        planItemTime(projection, left).localeCompare(planItemTime(projection, right)) ||
+        left.id.localeCompare(right.id),
+    )
+    .at(-1);
+  if (plan === undefined) return null;
+  const updatedAt = planItemTime(projection, plan);
+  return {
+    id: plan.id,
+    createdAt: updatedAt,
+    updatedAt,
+    runId: plan.runId,
+    planMarkdown: plan.markdown,
+    status: plan.status,
+  };
+}
+
+export function hasActionableProposedPlan(plan: LatestProposedPlanState | null): boolean {
+  return plan?.status === "active";
+}
+
+export function buildPlanImplementationPrompt(planMarkdown: string): string {
+  return `${PLAN_IMPLEMENTATION_PROMPT_PREFIX}${planMarkdown.trim()}`;
+}
+
+/** Text in the draft refines the plan; an empty draft implements it. */
+export function resolvePlanFollowUpSubmission(input: { draftText: string; planMarkdown: string }): {
+  text: string;
+  interactionMode: "default" | "plan";
+} {
+  const trimmedDraftText = input.draftText.trim();
+  if (trimmedDraftText.length > 0) {
+    return { text: trimmedDraftText, interactionMode: "plan" };
+  }
+  return {
+    text: buildPlanImplementationPrompt(input.planMarkdown),
+    interactionMode: "default",
+  };
+}
+
+export function buildPlanImplementationThreadTitle(planMarkdown: string): string {
+  const title = proposedPlanTitle(planMarkdown);
+  // oxlint-disable-next-line t3code/no-untranslated-copy -- thread titles are stored data other clients and agents read, so they stay English
+  return title ? `Implement ${title}` : "Implement plan";
+}
 
 export function buildProposedPlanMarkdownFilename(planMarkdown: string): string {
   const title = proposedPlanTitle(planMarkdown);
