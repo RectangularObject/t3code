@@ -1,0 +1,479 @@
+name: Fork nightly (Windows)
+
+# Fork-only: keeps `fork-nightly` rebased onto the newest upstream
+# v*-nightly.* tag and publishes an unsigned Windows x64 NSIS prerelease whose
+# in-app updater follows this repository's releases.
+#
+# Setup on the fork:
+#   1. Create the `fork-nightly` branch from an upstream nightly tag plus your
+#      patch commits, and make it the default branch. Scheduled and manually
+#      dispatched workflows run from the default branch, and `main` is
+#      force-mirrored from upstream, so this file cannot live there.
+#   2. Add a fine-grained PAT scoped to this fork as the FORK_SYNC_TOKEN secret,
+#      with Contents, Workflows, and Issues set to Read and write.
+#   3. Enable Issues on the fork so rebase conflicts can open an issue.
+#
+# The file is fork-owned and edits no upstream file, so rebasing it onto a new
+# upstream nightly never conflicts.
+
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream v*-nightly.* tag to build. Defaults to the newest one."
+        required: false
+        type: string
+      force_build:
+        description: "Build and replace the release even if one exists for the tag."
+        required: false
+        default: false
+        type: boolean
+      skip_sync:
+        description: "Skip the upstream rebase and build the dispatched ref as-is."
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: fork-nightly-windows
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPOSITORY: pingdotgg/t3code
+  SYNC_BRANCH: fork-nightly
+
+jobs:
+  sync:
+    name: Sync with upstream nightly
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      should_build: ${{ steps.release.outputs.should_build == 'false' && 'false' || steps.done.outputs.should_build }}
+      ref: ${{ steps.done.outputs.ref }}
+      tag: ${{ steps.target.outputs.tag }}
+      version: ${{ steps.target.outputs.version }}
+    env:
+      SKIP_SYNC: ${{ inputs.skip_sync && 'true' || 'false' }}
+      FORCE_BUILD: ${{ inputs.force_build && 'true' || 'false' }}
+      UPSTREAM_TAG_INPUT: ${{ inputs.upstream_tag }}
+    steps:
+      - name: Require FORK_SYNC_TOKEN
+        if: env.SKIP_SYNC != 'true'
+        env:
+          FORK_SYNC_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          if [[ -z "$FORK_SYNC_TOKEN" ]]; then
+            echo "::error title=FORK_SYNC_TOKEN is missing::Create a fine-grained personal access token with access to only ${GITHUB_REPOSITORY} and these repository permissions: Contents: Read & write, Workflows: Read & write, Issues: Read & write. Save it as the repository secret FORK_SYNC_TOKEN (Settings > Secrets and variables > Actions). Workflows write is required to push rebased commits that touch .github/workflows/. To build without syncing, run this workflow with skip_sync=true."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ env.SKIP_SYNC == 'true' && github.sha || env.SYNC_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      # --force replaces this fork's release tags, which point at rebased fork
+      # commits, with upstream's, so describe below finds the upstream base.
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --force --no-tags upstream \
+            "+refs/heads/main:refs/remotes/upstream/main" \
+            "+refs/tags/*:refs/tags/*"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve target tag
+        id: target
+        run: |
+          set -euo pipefail
+          nightly_pattern='^v[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]{8}\.[0-9]+$'
+          if [[ -n "$UPSTREAM_TAG_INPUT" ]]; then
+            tag="$UPSTREAM_TAG_INPUT"
+          elif [[ "$SKIP_SYNC" == "true" ]]; then
+            tag="$(git describe --tags --abbrev=0 --match 'v*-nightly.*' HEAD)"
+          else
+            # Sort by version, then date, then build number. Plain string
+            # sorting puts 0.1.9 above 0.1.10.
+            tag="$(git tag -l 'v*-nightly.*' \
+              | sed -nE 's/^v([0-9]+)\.([0-9]+)\.([0-9]+)-nightly\.([0-9]{8})\.([0-9]+)$/\1 \2 \3 \4 \5 &/p' \
+              | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n \
+              | tail -n 1 \
+              | cut -d' ' -f6)"
+          fi
+          if [[ ! "$tag" =~ $nightly_pattern ]]; then
+            echo "::error::'$tag' is not an upstream nightly tag (vX.Y.Z-nightly.YYYYMMDD.N)."
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/$tag^{commit}" >/dev/null; then
+            echo "::error::Tag $tag does not exist upstream."
+            exit 1
+          fi
+          echo "Target: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Check for an existing release
+        id: release
+        if: env.SKIP_SYNC != 'true' && env.FORCE_BUILD != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "A release for $TAG already exists. Nothing to do."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mirror upstream main
+        if: env.SKIP_SYNC != 'true' && steps.release.outputs.should_build != 'false'
+        run: |
+          set -euo pipefail
+          expected="$(git rev-parse -q --verify refs/remotes/origin/main || true)"
+          git push --force-with-lease="main:${expected}" origin "refs/remotes/upstream/main:refs/heads/main"
+
+      - name: Rebase fork patches
+        id: rebase
+        if: env.SKIP_SYNC != 'true' && steps.release.outputs.should_build != 'false'
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          original_head="$(git rev-parse HEAD)"
+          echo "original_head=$original_head" >> "$GITHUB_OUTPUT"
+
+          # The nearest upstream nightly tag is the base the patches sit on. A
+          # merge-base with upstream main that descends from it is closer still.
+          old_base="$(git describe --tags --abbrev=0 --match 'v*-nightly.*' HEAD 2>/dev/null || true)"
+          merge_base="$(git merge-base HEAD refs/remotes/upstream/main || true)"
+          if [[ -z "$old_base" ]]; then
+            old_base="$merge_base"
+          elif [[ -n "$merge_base" ]] && git merge-base --is-ancestor "$old_base" "$merge_base" &&
+            [[ "$(git rev-parse "$old_base^{commit}")" != "$merge_base" ]]; then
+            old_base="$merge_base"
+          fi
+          if [[ -z "$old_base" ]]; then
+            echo "::error::Could not find the upstream base of $SYNC_BRANCH."
+            exit 1
+          fi
+          echo "old_base=$old_base" >> "$GITHUB_OUTPUT"
+
+          target_commit="$(git rev-parse "refs/tags/$TAG^{commit}")"
+          base_commit="$(git rev-parse "$old_base^{commit}")"
+          echo "Fork patches ($old_base..$SYNC_BRANCH):"
+          git log --oneline "$base_commit..HEAD"
+
+          if [[ "$base_commit" == "$target_commit" ]]; then
+            echo "$SYNC_BRANCH is already based on $TAG."
+            exit 0
+          fi
+
+          if git rebase --onto "$target_commit" "$base_commit"; then
+            echo "Rebased $SYNC_BRANCH onto $TAG."
+            exit 0
+          fi
+
+          {
+            echo "conflict=true"
+            echo "stopped_at=$(git log -1 --format='%h %s' REBASE_HEAD 2>/dev/null || echo unknown)"
+            echo "files<<EOF"
+            git diff --name-only --diff-filter=U
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          git rebase --abort
+          echo "::error::Rebasing $SYNC_BRANCH onto $TAG stopped with conflicts. $SYNC_BRANCH was left unchanged."
+          exit 1
+
+      - name: Push rebased branch
+        if: env.SKIP_SYNC != 'true' && steps.release.outputs.should_build != 'false'
+        env:
+          ORIGINAL_HEAD: ${{ steps.rebase.outputs.original_head }}
+        run: |
+          set -euo pipefail
+          if [[ "$(git rev-parse HEAD)" == "$ORIGINAL_HEAD" ]]; then
+            echo "Nothing to push."
+            exit 0
+          fi
+          git push --force-with-lease="${SYNC_BRANCH}:${ORIGINAL_HEAD}" origin "HEAD:refs/heads/${SYNC_BRANCH}"
+
+      - name: Report rebase conflict
+        if: failure() && steps.rebase.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          TAG: ${{ steps.target.outputs.tag }}
+          OLD_BASE: ${{ steps.rebase.outputs.old_base }}
+          STOPPED_AT: ${{ steps.rebase.outputs.stopped_at }}
+          FILES: ${{ steps.rebase.outputs.files }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="[fork-sync] Conflict rebasing onto $TAG"
+          {
+            echo "Rebasing the fork patches on \`$SYNC_BRANCH\` onto upstream [\`$TAG\`](https://github.com/$UPSTREAM_REPOSITORY/releases/tag/$TAG) stopped with conflicts. \`$SYNC_BRANCH\` was left unchanged and no build was published."
+            echo
+            echo "Stopped at: \`$STOPPED_AT\`"
+            echo
+            echo "Conflicting files:"
+            echo
+            while IFS= read -r file; do
+              [[ -n "$file" ]] && echo "- \`$file\`"
+            done <<<"$FILES"
+            echo
+            echo "Resolve it locally:"
+            echo
+            echo '```bash'
+            echo "git remote add upstream https://github.com/$UPSTREAM_REPOSITORY.git  # only once"
+            echo "git fetch upstream --tags --force && git checkout $SYNC_BRANCH && git rebase --onto $TAG $OLD_BASE"
+            echo "# Fix each conflict, then: git add <files> && git rebase --continue"
+            echo "git push --force-with-lease origin $SYNC_BRANCH"
+            echo '```'
+            echo
+            echo "The next scheduled run then builds $TAG. To build now, run this workflow with \`upstream_tag: $TAG\`. This issue closes on the next successful sync."
+            echo
+            echo "Run: $RUN_URL"
+          } > issue.md
+
+          gh label create fork-sync --repo "$GITHUB_REPOSITORY" --color B60205 \
+            --description "Fork nightly sync needs attention" --force >/dev/null 2>&1 || true
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 --json number,title \
+            --jq '[.[] | select(.title | startswith("[fork-sync]"))][0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            gh issue edit "$existing" --repo "$GITHUB_REPOSITORY" --title "$title" --body-file issue.md
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "Still conflicting on \`$TAG\`: $RUN_URL"
+            echo "Updated issue #$existing."
+          else
+            # The label is a convenience; the title prefix is what runs search for.
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file issue.md --label fork-sync ||
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file issue.md
+          fi
+
+      - name: Close resolved conflict issues
+        if: env.SKIP_SYNC != 'true' && steps.release.outputs.should_build != 'false'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 --json number,title \
+            --jq '.[] | select(.title | startswith("[fork-sync]")) | .number' |
+            while read -r number; do
+              gh issue close "$number" --repo "$GITHUB_REPOSITORY" \
+                --comment "Resolved: \`$SYNC_BRANCH\` now rebases cleanly onto \`$TAG\`."
+            done
+
+      - name: Set outputs
+        id: done
+        if: steps.release.outputs.should_build != 'false'
+        run: |
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build_windows:
+    name: Build and publish Windows x64
+    needs: sync
+    if: needs.sync.outputs.should_build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.sync.outputs.version }}
+      RELEASE_REF: ${{ needs.sync.outputs.ref }}
+      # Bakes this fork into app-update.yml, so installs update from its releases.
+      T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+      RUST_TARGET: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.sync.outputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      # Steps that call vp use pwsh, as windows-tests.yml does.
+      - name: Resolve pnpm store path
+        id: pnpm_store
+        shell: pwsh
+        run: '"path=$(vp pm cache dir)" >> $env:GITHUB_OUTPUT'
+
+      - name: Cache pnpm store
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.pnpm_store.outputs.path }}
+          key: fork-nightly-windows-pnpm-v1-${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'package.json') }}
+          restore-keys: fork-nightly-windows-pnpm-v1-
+
+      - name: Install dependencies
+        shell: pwsh
+        run: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      # These public identifiers are what official builds ship. Repository
+      # variables of the same name override them.
+      - name: Load T3 Connect config
+        env:
+          VAR_CLERK_PUBLISHABLE_KEY: ${{ vars.T3CODE_CLERK_PUBLISHABLE_KEY }}
+          VAR_CLERK_JWT_TEMPLATE: ${{ vars.T3CODE_CLERK_JWT_TEMPLATE }}
+          VAR_CLERK_CLI_OAUTH_CLIENT_ID: ${{ vars.T3CODE_CLERK_CLI_OAUTH_CLIENT_ID }}
+          VAR_RELAY_URL: ${{ vars.T3CODE_RELAY_URL }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in CLERK_PUBLISHABLE_KEY CLERK_JWT_TEMPLATE CLERK_CLI_OAUTH_CLIENT_ID RELAY_URL; do
+            override="VAR_$name"
+            value="${!override:-$(sed -n "s|^T3CODE_$name=||p" .env.example | head -n 1 | tr -d '\r')}"
+            if [[ -z "$value" ]]; then
+              missing+=("T3CODE_$name")
+            fi
+            echo "T3CODE_$name=$value" >> "$GITHUB_ENV"
+            echo "T3CODE_$name=$value"
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing T3 Connect config: ${missing[*]}. Set it in .env.example or as repository variables."
+            exit 1
+          fi
+
+      - name: Cache resource monitor
+        id: resource_monitor_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: native/resource-monitor/target/${{ env.RUST_TARGET }}/release/t3-resource-monitor.exe
+          key: fork-resource-monitor-${{ env.RUST_TARGET }}-${{ hashFiles('.cargo/config.toml', 'native/resource-monitor/Cargo.lock', 'native/resource-monitor/Cargo.toml', 'native/resource-monitor/src/**') }}
+
+      - name: Setup Rust
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: ${{ env.RUST_TARGET }}
+
+      # Built here so the desktop build can reuse it, which also skips its
+      # Visual Studio Spectre-library preflight that only the Rust build needs.
+      - name: Build resource monitor
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        run: cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target "$RUST_TARGET"
+
+      # Without --skip-build the script aligns package versions, runs
+      # `vp run build:desktop` (server, web, desktop), and restores the
+      # manifests. No --signed: unsigned. No --wsl-runtime: the WSL backend
+      # runs without an embedded Linux runtime archive.
+      # T3CODE_DESKTOP_UNTRUSTED_BUNDLE=true skips prepare-server-compile-cache.cjs
+      # (matching upstream's Linux-hosted Windows builds); on native Windows the
+      # 29 bytecode cache files push win-unpacked past upstream's 80-file limit.
+      - name: Build desktop artifact
+        shell: pwsh
+        env:
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: "true"
+          T3CODE_DESKTOP_UNTRUSTED_BUNDLE: "true"
+        run: vp run dist:desktop:artifact --platform win --target nsis --arch x64 --build-version "$env:RELEASE_VERSION" --verbose
+
+      # electron-builder writes the updater manifest only when a publish config
+      # is set. The nightly channel's Windows manifest is nightly.yml.
+      - name: Verify release files
+        run: |
+          set -euo pipefail
+          installer="release/T3-Code-${RELEASE_VERSION}-x64.exe"
+          ls -la release
+          for file in "$installer" "$installer.blockmap" release/nightly.yml; do
+            if [[ ! -f "$file" ]]; then
+              echo "::error::Missing $file."
+              exit 1
+            fi
+          done
+          cat release/nightly.yml
+          nightly_manifest="$(tr -d '\r' < release/nightly.yml)"
+          if ! grep -qx "version: ${RELEASE_VERSION}" <<<"$nightly_manifest" ||
+            ! grep -q "T3-Code-${RELEASE_VERSION}-x64.exe" <<<"$nightly_manifest"; then
+            echo "::error::release/nightly.yml does not describe $installer."
+            exit 1
+          fi
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          assets=(
+            "release/T3-Code-${RELEASE_VERSION}-x64.exe"
+            "release/T3-Code-${RELEASE_VERSION}-x64.exe.blockmap"
+            "release/nightly.yml"
+          )
+          title="T3 Code (Nightly) ${RELEASE_VERSION} (fork)"
+          cat > release-notes.md <<EOF
+          Unsigned Windows x64 build of upstream [\`${RELEASE_TAG}\`](https://github.com/${UPSTREAM_REPOSITORY}/releases/tag/${RELEASE_TAG}) with this fork's patches (\`${SYNC_BRANCH}\` at ${RELEASE_REF}).
+
+          The installer is not code-signed, so Windows SmartScreen warns on first install. Installed builds update in-app from this repository's releases.
+          EOF
+
+          # A tag left from the original fork or an earlier forced build can name
+          # another commit. Point it at the commit this release was built from.
+          current=""
+          if sha="$(gh api "repos/${GH_REPO}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha // empty' 2>/dev/null)"; then
+            current="$sha"
+          fi
+          if [[ -z "$current" ]]; then
+            gh api -X POST "repos/${GH_REPO}/git/refs" -f ref="refs/tags/${RELEASE_TAG}" -f sha="$RELEASE_REF" >/dev/null
+          elif [[ "$current" != "$RELEASE_REF" ]]; then
+            gh api -X PATCH "repos/${GH_REPO}/git/refs/tags/${RELEASE_TAG}" -f sha="$RELEASE_REF" -F force=true >/dev/null ||
+              echo "::warning::Could not move tag ${RELEASE_TAG} to ${RELEASE_REF}; the release keeps the existing tag."
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+            gh release edit "$RELEASE_TAG" --title "$title" --notes-file release-notes.md \
+              --prerelease --latest=false --draft=false
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" --verify-tag --title "$title" \
+              --notes-file release-notes.md --prerelease --latest=false
+          fi
+
+      # Nightly installs find updates in releases.atom and, when that names no
+      # newer nightly, at this fixed pointer (see docs/operations/release.md).
+      # It only moves forward, so a forced rebuild of an older tag keeps it.
+      - name: Point the update feed at this nightly
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          pointer="$(gh release download update-feed --pattern nightly.json --output - 2>/dev/null | jq -r '.tag_name // empty' || true)"
+          if [[ -n "$pointer" && "$(printf '%s\n%s\n' "$pointer" "$RELEASE_TAG" | sort -V | tail -n 1)" != "$RELEASE_TAG" ]]; then
+            echo "The update feed already points at the newer $pointer."
+            exit 0
+          fi
+          gh api "repos/${GH_REPO}/releases/tags/${RELEASE_TAG}" --jq '{tag_name, name, body}' > nightly.json
+          gh release view update-feed >/dev/null 2>&1 ||
+            gh release create update-feed --prerelease --latest=false --title "Update feed" \
+              --notes "The desktop updater reads this release to find the newest nightly. Do not delete it."
+          gh release upload update-feed nightly.json --clobber
