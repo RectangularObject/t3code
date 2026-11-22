@@ -37,6 +37,8 @@ import { useRightPanelActions } from "./chat/useRightPanelActions";
 import { type TerminalLaunchContext, useChatTerminalActions } from "./chat/useChatTerminalActions";
 import { useComposerSend } from "./chat/useComposerSend";
 import { useComposerResume } from "./chat/useComposerResume";
+import { useChatPlanMode } from "./chat/useChatPlanMode";
+import { useImplementPlanInNewThread } from "./chat/useProposedPlanSend";
 import { ThreadFind, ThreadFindCanvas } from "./chat/ThreadFindProvider";
 import { closeThreadFind, openThreadFind, useThreadFindOpen } from "./chat/threadFindStore";
 import { THREAD_FIND_BAR_RESERVED_HEIGHT } from "./chat/ThreadFindBar";
@@ -170,7 +172,7 @@ import {
 } from "../session-logic";
 import { type LegendListRef } from "@legendapp/list/react";
 import { useWorkspaceRevision } from "../hooks/useWorkspaceRevision";
-import { DEFAULT_INTERACTION_MODE, type ChatMessage } from "../types";
+import { type ChatMessage } from "../types";
 import { buildThreadRouteParams } from "../threadRoutes";
 import { useTheme } from "../hooks/useTheme";
 import { copyThreadReference } from "../lib/copyThreadReference";
@@ -1950,6 +1952,24 @@ export default function ChatView(props: ChatViewProps) {
 
   const { focusComposer: focusComposerStable, scheduleComposerFocus: scheduleComposerFocusStable } =
     useComposerFocus(composerRef);
+  const {
+    interactionMode,
+    activeProposedPlan,
+    showPlanFollowUpPrompt,
+    handleInteractionModeChange,
+    toggleInteractionMode,
+  } = useChatPlanMode({
+    composerDraftTarget,
+    threadInteractionMode: activeThread?.interactionMode,
+    provider: activeProviderStatus,
+    serverProjection,
+    latestRunId: activeLatestRun?.runId ?? null,
+    latestRunSettled,
+    pendingUserInputCount: pendingUserInputs.length,
+    composerHasAttachments,
+    isLocalDraftThread,
+    scheduleComposerFocus: scheduleComposerFocusStable,
+  });
   const canInterruptRunningThread =
     canOperateThread && deriveCanInterruptRunningThread(activeThread !== undefined, activeRuntime);
   const onInterrupt = async () => {
@@ -2003,7 +2023,7 @@ export default function ChatView(props: ChatViewProps) {
         threadId: activeThreadId,
         message: { messageId: newMessageId(), role: "user", text, attachments: [] },
         runtimeMode,
-        interactionMode: DEFAULT_INTERACTION_MODE,
+        interactionMode,
         dispatchMode: "queue",
       },
     });
@@ -2636,7 +2656,8 @@ export default function ChatView(props: ChatViewProps) {
     activeEnvironmentUnavailable ||
     feedbackUploading ||
     pendingApprovals.length > 0 ||
-    pendingUserInputs.length > 0;
+    pendingUserInputs.length > 0 ||
+    showPlanFollowUpPrompt;
   const compactDisabled = compactThreadUnavailable;
   const freshSessionAvailable =
     activeMessageCount > 0 && serverConfig?.environment.capabilities.freshContext === true;
@@ -3090,6 +3111,7 @@ export default function ChatView(props: ChatViewProps) {
     threadDetailLoading,
     activeEnvironmentUnavailable,
     runtimeMode,
+    interactionMode,
     localCheckoutBranchMismatch,
     composerRef,
     persistThreadSettingsForNextTurn,
@@ -3172,9 +3194,28 @@ export default function ChatView(props: ChatViewProps) {
     onSideChat: sideChat.available ? sendSideChatStable : undefined,
     sideChatDisabledReason,
     handleNewThreadInActiveProject,
+    activeProposedPlan,
+    showPlanFollowUpPrompt,
+    handleInteractionModeChange,
     persistThreadSettingsForNextTurn,
     linkCheckoutPullRequest,
   });
+  const onImplementPlanInNewThread = useImplementPlanInNewThread({
+    environmentId,
+    routeThreadKey,
+    activeThread,
+    activeThreadBranch,
+    activeProposedPlan,
+    isServerThread,
+    isSendBusy,
+    composerRef,
+    beginLocalDispatch,
+    resetLocalDispatch,
+    activeProject,
+    activeEnvironmentUnavailable,
+    defaultRuntimeMode,
+  });
+  const onImplementPlanInNewThreadStable = useStableCallback(onImplementPlanInNewThread);
 
   const onWorktreeSetupWorkLocally = () => {
     if (!worktreeSetup || worktreeSetup.phase !== "running" || !draftId) {
@@ -3901,6 +3942,12 @@ export default function ChatView(props: ChatViewProps) {
                                 pendingUserInputs={pendingUserInputs}
                                 activePendingIsResponding={activePendingIsResponding}
                                 respondingRequestIds={respondingRequestIds}
+                                showPlanFollowUpPrompt={showPlanFollowUpPrompt}
+                                activeProposedPlan={activeProposedPlan}
+                                interactionMode={interactionMode}
+                                toggleInteractionMode={toggleInteractionMode}
+                                handleInteractionModeChange={handleInteractionModeChange}
+                                onImplementPlanInNewThread={onImplementPlanInNewThreadStable}
                                 runtimeMode={runtimeMode}
                                 defaultRuntimeMode={defaultRuntimeMode}
                                 lockedProvider={modelPickerLockedProvider}
