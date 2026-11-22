@@ -32,6 +32,7 @@ import type {
   PreviewAnnotationPayload,
   ThreadContextRecord,
   EnvironmentContextRecord,
+  ProviderInteractionMode,
   ResolvedKeybindingsConfig,
   RuntimeMode,
   RuntimeRequestId,
@@ -221,6 +222,10 @@ import {
 import { CollapsedComposerStopAction, ComposerPrimaryActions } from "./ComposerPrimaryActions";
 import { ComposerFooterPrimaryActions } from "./ComposerFooterControls";
 import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
+import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
+import { resolveComposerInteractionMode } from "./planMode.logic";
+import { proposedPlanTitle } from "@t3tools/shared/proposedPlanText";
+import type { LatestProposedPlanState } from "../../proposedPlan";
 import { resolveComposerMenuActiveItemId } from "./composerMenuHighlight";
 import { buildPullRequestReferenceContext } from "../pullRequest/pullRequestDetail.logic";
 import { getComposerPromptInjectionState, getComposerReasoningStep } from "./composerProviderState";
@@ -352,6 +357,8 @@ export interface ChatComposerHandle {
     selectedProvider: ProviderDriverKind;
     selectedModel: string;
     selectedProviderModels: ReadonlyArray<ServerProvider["models"][number]>;
+    interactionMode: ProviderInteractionMode;
+    interactionModeEnabled: boolean;
     shownPendingApprovalIds: ReadonlyArray<RuntimeRequestId>;
   };
   validateProviderInput: (providerInput: string) => boolean;
@@ -410,6 +417,13 @@ export interface ChatComposerProps {
   pendingUserInputs: PendingUserInput[];
   activePendingIsResponding: boolean;
   respondingRequestIds: RuntimeRequestId[];
+
+  showPlanFollowUpPrompt: boolean;
+  activeProposedPlan: LatestProposedPlanState | null;
+  interactionMode: ProviderInteractionMode;
+  toggleInteractionMode: () => void;
+  handleInteractionModeChange: (mode: ProviderInteractionMode) => void;
+  onImplementPlanInNewThread: () => void;
 
   runtimeMode: RuntimeMode;
   defaultRuntimeMode?: RuntimeMode;
@@ -544,6 +558,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     pendingUserInputs: incomingPendingUserInputs,
     activePendingIsResponding: incomingPendingIsResponding,
     respondingRequestIds,
+    showPlanFollowUpPrompt,
+    activeProposedPlan,
+    interactionMode: requestedInteractionMode,
+    toggleInteractionMode,
+    handleInteractionModeChange,
+    onImplementPlanInNewThread,
     runtimeMode,
     lockedProvider,
     providerStatuses,
@@ -975,6 +995,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         (multipleModelSelections === null ? providerSendBlockReason : null)));
   const isSendDisabled = sendDisabledReason !== null;
   const selectedProviderStatus = selectedProviderEntry?.snapshot ?? null;
+  const { enabled: planModeUiEnabled, interactionMode } = resolveComposerInteractionMode({
+    provider: selectedProviderStatus,
+    interactionMode: requestedInteractionMode,
+  });
   const selectedProviderSkills = selectedProviderStatus
     ? resolveProviderSkillsForCwd(selectedProviderStatus, gitCwd)
     : NO_PROVIDER_SKILLS;
@@ -1167,6 +1191,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     pullRequestProjectId,
     pullRequestRepository,
     threadPullRequests,
+    planModeUiEnabled,
     sideChatAvailable: props.sideChatAvailable === true,
     sideChatDisabledReason: props.sideChatDisabledReason ?? null,
     freshSessionAvailable: props.onFreshSession !== undefined,
@@ -1212,14 +1237,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const activePendingUserInput = pendingUserInputs[0] ?? null;
   const isChoiceOnlyPendingQuestion =
     activePendingProgress?.activeQuestion?.allowCustomAnswer === false;
-  const showComposerTopDrawer = pendingUserInputs.length > 0;
+  const showComposerTopDrawer =
+    pendingUserInputs.length > 0 ||
+    (!isComposerCollapsedMobile && showPlanFollowUpPrompt && activeProposedPlan !== null);
   const showCollapsedMobilePromptRow = isComposerCollapsedMobile;
   const showComposerAttachAction =
     fileStagingLimit !== null &&
     (!activePendingProgress ||
       (supportsQuestionAttachments &&
         activePendingProgress.activeQuestion?.allowCustomAnswer !== false));
-  const composerFooterHasWideActions = activePendingProgress !== null;
+  const composerFooterHasWideActions = showPlanFollowUpPrompt || activePendingProgress !== null;
 
   const editPromptFromTraits = (edit: (prompt: string) => string) => {
     const currentPrompt = getComposerDraft(composerDraftTarget)?.prompt ?? "";
@@ -2024,6 +2051,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         if (applied) setComposerHighlightedItemId(null);
         return;
       }
+      if (item.command === "plan" || item.command === "default") {
+        if (!planModeUiEnabled) return;
+        handleInteractionModeChange(item.command);
+        const applied = applyPromptReplacement(trigger.rangeStart, trigger.rangeEnd, "", {
+          expectedText: snapshot.value.slice(trigger.rangeStart, trigger.rangeEnd),
+        });
+        if (applied) setComposerHighlightedItemId(null);
+        return;
+      }
       return;
     }
     if (item.type === "provider-slash-command") {
@@ -2195,7 +2231,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     if (activePendingProgress) {
       return activePendingProgress.isLastQuestion && Boolean(activePendingResolvedAnswers);
     }
-    return composerSendState.hasSendableContent;
+    return showPlanFollowUpPrompt || composerSendState.hasSendableContent;
   };
 
   const submitComposerRef = useRef<
@@ -2476,6 +2512,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       canSteer,
       followUpBehavior,
       isSoftwareKeyboardOpen,
+      planModeUiEnabled,
       isLiteralPendingAnswer,
       pendingUserInputs,
       promptHistoryEntries,
@@ -2497,6 +2534,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       setComposerTrigger,
       setComposerHighlightedItemId,
       dismissComposerTrigger,
+      toggleInteractionMode,
       nudgeComposerMenuHighlight,
       onSelectComposerItem,
       resolveActiveComposerTrigger,
@@ -2597,6 +2635,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       reportedModelSelection={reportedModelSelection}
       promptUltrathink={promptUltrathink}
       onPromptEdit={editPromptFromTraitsStable}
+      planModeUiEnabled={planModeUiEnabled}
+      interactionMode={interactionMode}
+      toggleInteractionMode={toggleInteractionMode}
       compatibleRuntimeMode={compatibleRuntimeMode}
       defaultRuntimeMode={props.defaultRuntimeMode}
       compatibleRuntimeModeOptions={compatibleRuntimeModeOptions}
@@ -3389,6 +3430,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         selectedProvider,
         selectedModel,
         selectedProviderModels,
+        interactionMode,
+        interactionModeEnabled: planModeUiEnabled,
       }),
       setMultipleModelSelections,
       validateProviderInput: (providerInput: string) => {
@@ -3452,6 +3495,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       selectedPromptEffort,
       selectedProvider,
       selectedProviderModels,
+      interactionMode,
+      planModeUiEnabled,
       compactThreadContextStable,
     ],
   );
@@ -3581,6 +3626,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     onToggleOption={onSelectActivePendingUserInputOption}
                     onAdvance={onAdvanceActivePendingUserInput}
                     onDismiss={onDismissActivePendingUserInput}
+                  />
+                ) : !isComposerCollapsedMobile && showPlanFollowUpPrompt && activeProposedPlan ? (
+                  <ComposerPlanFollowUpBanner
+                    key={activeProposedPlan.id}
+                    planTitle={proposedPlanTitle(activeProposedPlan.planMarkdown) ?? null}
                   />
                 ) : null}
               </ComposerBanner.Root>
@@ -3821,11 +3871,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                               : gt(
                                   "Type your own answer, or leave this blank to use the selected option",
                                 )
-                          : projectSelectionRequired
-                            ? gt("Choose a project above to start a thread")
-                            : showProviderUnavailable
-                              ? gt("Enable a provider in Settings to send a message")
-                              : (offeredPromptSuggestion ?? m(DEFAULT_COMPOSER_PLACEHOLDER))
+                          : showPlanFollowUpPrompt && activeProposedPlan
+                            ? gt(
+                                "Add feedback to refine the plan, or leave this blank to implement it",
+                              )
+                            : projectSelectionRequired
+                              ? gt("Choose a project above to start a thread")
+                              : showProviderUnavailable
+                                ? gt("Enable a provider in Settings to send a message")
+                                : (offeredPromptSuggestion ?? m(DEFAULT_COMPOSER_PLACEHOLDER))
                     }
                     placeholderSuffix={
                       offeredPromptSuggestion !== null ? (
@@ -3957,6 +4011,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                         },
                       },
                     )}
+                    showPlanFollowUpPrompt={
+                      pendingUserInputs.length === 0 && showPlanFollowUpPrompt
+                    }
+                    promptHasText={prompt.trim().length > 0 || voiceInputActive}
                     voiceInputActive={voiceInputActive}
                     isSendBusy={isSendBusy}
                     sendDisabledReason={primaryActionSendDisabledReason}
@@ -3970,6 +4028,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     onResume={onResume}
                     onPreviousPendingQuestion={onPreviousActivePendingUserInputQuestion}
                     onInterrupt={handleInterruptPrimaryActionStable}
+                    onImplementPlanInNewThread={onImplementPlanInNewThread}
                     compactBeforeSendTokens={props.resumeCompactionTokens}
                     hideCompactToggle={dictationTakesFooter}
                     keepFullHistory={props.keepFullHistory}

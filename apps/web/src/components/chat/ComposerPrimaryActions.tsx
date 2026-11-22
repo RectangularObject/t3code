@@ -24,6 +24,7 @@ import { StageBackdropButtonArt, useSidebarStageBackdropVariant } from "../Sideb
 import { Button } from "../ui/button";
 import { Spinner } from "../ui/spinner";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { ComposerPlanFollowUpActions } from "./ComposerPlanFollowUpBanner";
 import {
   alternateComposerDispatchAction,
   resolveComposerDispatchMode,
@@ -67,6 +68,9 @@ interface ComposerPrimaryActionsProps {
   hideCompactToggle?: boolean;
   keepFullHistory?: boolean;
   onToggleKeepFullHistory?: () => void;
+  showPlanFollowUpPrompt?: boolean;
+  promptHasText?: boolean;
+  onImplementPlanInNewThread?: () => void;
 }
 
 const formatPendingPrimaryActionLabel = (
@@ -259,6 +263,9 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   hideCompactToggle = false,
   keepFullHistory = false,
   onToggleKeepFullHistory,
+  showPlanFollowUpPrompt = false,
+  promptHasText = false,
+  onImplementPlanInNewThread,
 }: ComposerPrimaryActionsProps) {
   const gt = useGT();
   const m = useMessages();
@@ -362,6 +369,23 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
           ? renderStopGenerationButton(true)
           : null}
       </div>
+    );
+  }
+
+  if (showPlanFollowUpPrompt && (promptHasText || !canResume)) {
+    return (
+      <ComposerPlanFollowUpActions
+        compact={compact}
+        promptHasText={promptHasText}
+        disabled={isSendBusy || isSendDisabled || isEnvironmentUnavailable}
+        isSendBusy={isSendBusy}
+        canOperateThread={canOperateThread}
+        pillClassName={messageActionPillClassName}
+        onPointerDown={pointerFocusProps?.onPointerDown}
+        onImplementPlanInNewThread={onImplementPlanInNewThread}
+      >
+        {children}
+      </ComposerPlanFollowUpActions>
     );
   }
 
