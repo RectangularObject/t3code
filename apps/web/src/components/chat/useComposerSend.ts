@@ -62,7 +62,8 @@ import {
   type ComposerSubmissionIntent,
   collapseExpandedComposerCursor,
 } from "../../composer-logic";
-import { type ChatMessage, DEFAULT_INTERACTION_MODE } from "../../types";
+import { type ChatMessage } from "../../types";
+import type { LatestProposedPlanState } from "../../proposedPlan";
 import { recordPromptSent } from "../GitHubStarPrompt";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
@@ -109,6 +110,7 @@ import {
   referencedThreadContexts,
 } from "./composerSend.logic";
 import { useMultipleModelSend } from "./useMultipleModelSend";
+import { usePlanModeComposerSend } from "./useProposedPlanSend";
 import type { SideChatMessage } from "./useSideChat";
 import { type ComposerDispatchMode } from "@t3tools/client-runtime/state/composer-dispatch";
 import {
@@ -284,6 +286,9 @@ interface ComposerSendInput {
   /** Refuses `/side` with this reason and keeps the draft. */
   readonly sideChatDisabledReason: string | null;
   readonly handleNewThreadInActiveProject: () => void;
+  readonly activeProposedPlan: LatestProposedPlanState | null;
+  readonly showPlanFollowUpPrompt: boolean;
+  readonly handleInteractionModeChange: (mode: ProviderInteractionMode) => void;
   readonly persistThreadSettingsForNextTurn: (input: {
     threadId: ThreadId;
     createdAt: string;
@@ -403,6 +408,7 @@ export function useComposerSend(input: ComposerSendInput) {
     resetLocalDispatch,
     setThreadError,
   });
+  const sendPlanModeSubmission = usePlanModeComposerSend(input);
   const { sendInFlight: sendInFlightRef } = draftSendState(routeThreadKey);
   const composerSendGenerationRef = useRef(0);
   const environmentUnavailableSendToastSlotRef = useRef(0);
@@ -809,6 +815,7 @@ export function useComposerSend(input: ComposerSendInput) {
       selectedProviderModels: ctxSelectedProviderModels,
       selectedPromptEffort: ctxSelectedPromptEffort,
       selectedModelSelection: ctxSelectedModelSelection,
+      interactionMode: sendInteractionMode,
     } = sendCtx;
     const { images: composerImages, previewAnnotations: composerPreviewAnnotations } =
       mergeDirectPreviewAnnotation({
@@ -959,6 +966,25 @@ export function useComposerSend(input: ComposerSendInput) {
     }
     // Read once: an arm made while this send is in flight belongs to the next message.
     const freshArm = freshSessionAvailable ? readFreshSessionArm(routeThreadKey) : undefined;
+    if (
+      await sendPlanModeSubmission({
+        sendCtx,
+        promptForSend,
+        trimmed,
+        composerHoldsOnlyText,
+        hasAttachments: composerImages.length > 0 || composerFiles.length > 0,
+        terminalContexts: sendableComposerTerminalContexts,
+        reviewComments: composerReviewComments,
+        previewAnnotations: composerPreviewAnnotations,
+        threadContexts: composerThreadContexts,
+        environmentContexts: composerEnvironmentContexts,
+        replyTo,
+        submissionIntent,
+        regularSendOnly: directAnnotation !== undefined || freshArm !== undefined,
+      })
+    ) {
+      return;
+    }
     if (!hasSendableContent) {
       if (expiredTerminalContextCount > 0) {
         const toastCopy = buildExpiredTerminalContextToastCopy(
@@ -1114,6 +1140,7 @@ export function useComposerSend(input: ComposerSendInput) {
       selections: multipleModelSelections ?? [],
       providerInstanceEntries,
       messageText: messageTextForSend,
+      interactionMode: sendInteractionMode,
     })) {
       if ("error" in resolved) {
         setThreadError(threadIdForSend, resolved.error);
@@ -1488,7 +1515,7 @@ export function useComposerSend(input: ComposerSendInput) {
           ? { branch: localCheckoutBranchMismatch.currentBranch }
           : {}),
         runtimeMode,
-        interactionMode: DEFAULT_INTERACTION_MODE,
+        interactionMode: sendInteractionMode,
       });
       if (settingsResult._tag === "Failure") {
         failure = settingsResult;
@@ -1521,7 +1548,7 @@ export function useComposerSend(input: ComposerSendInput) {
           },
           modelSelection: ctxSelectedModelSelection,
           runtimeMode,
-          interactionMode: DEFAULT_INTERACTION_MODE,
+          interactionMode: sendInteractionMode,
         },
       });
       if (compactResult._tag === "Failure") {
@@ -1542,7 +1569,7 @@ export function useComposerSend(input: ComposerSendInput) {
                       title,
                       modelSelection: threadCreateModelSelection,
                       runtimeMode,
-                      interactionMode: DEFAULT_INTERACTION_MODE,
+                      interactionMode: sendInteractionMode,
                       branch: activeThreadBranch,
                       worktreePath: activeThread.worktreePath,
                       createdAt: activeThread.createdAt,
@@ -1592,7 +1619,7 @@ export function useComposerSend(input: ComposerSendInput) {
           modelSelection: ctxSelectedModelSelection,
           titleSeed: title,
           runtimeMode,
-          interactionMode: DEFAULT_INTERACTION_MODE,
+          interactionMode: sendInteractionMode,
           dispatchMode: turnDispatchMode,
           ...(freshArm === undefined ? {} : { freshContext: true }),
           ...(bootstrap ? { bootstrap } : {}),
