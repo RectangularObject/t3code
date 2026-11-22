@@ -18,7 +18,10 @@ name: Fork nightly (Windows)
 
 on:
   schedule:
-    - cron: "23 6 * * *"
+    # Upstream enforces a 6-hour minimum gap between scheduled nightlies
+    # (typically publishing in :19-:27 or :47-:59). Run every 6 hours at :31
+    # to clear the :19-:27 window; no-op runs exit before checkout.
+    - cron: "31 */6 * * *"
   workflow_dispatch:
     inputs:
       upstream_tag:
@@ -41,7 +44,9 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
+  issues: read
 
 env:
   UPSTREAM_REPOSITORY: pingdotgg/t3code
@@ -54,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
-      should_build: ${{ steps.release.outputs.should_build == 'false' && 'false' || steps.done.outputs.should_build }}
+      should_build: ${{ steps.done.outputs.should_build || 'false' }}
       ref: ${{ steps.done.outputs.ref }}
       tag: ${{ steps.target.outputs.tag }}
       version: ${{ steps.target.outputs.version }}
@@ -73,7 +78,108 @@ jobs:
             exit 1
           fi
 
+      - name: Check for new upstream nightly
+        id: precheck
+        if: env.SKIP_SYNC != 'true' && env.FORCE_BUILD != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          nightly_pattern='^v[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]{8}\.[0-9]+$'
+          if [[ -n "$UPSTREAM_TAG_INPUT" ]]; then
+            tag="$UPSTREAM_TAG_INPUT"
+            if [[ ! "$tag" =~ $nightly_pattern ]]; then
+              echo "::error::'$tag' is not an upstream nightly tag (vX.Y.Z-nightly.YYYYMMDD.N)."
+              exit 1
+            fi
+            tag_refs="$(git ls-remote --tags "https://github.com/${UPSTREAM_REPOSITORY}.git" "refs/tags/${tag}" "refs/tags/${tag}^{}")"
+            tag_sha="$(awk -v t="refs/tags/${tag}" '
+              $2 == t "^{}" { peeled = $1 }
+              $2 == t { direct = $1 }
+              END { print (peeled != "" ? peeled : direct) }
+            ' <<<"$tag_refs")"
+            if [[ -z "$tag_sha" ]]; then
+              echo "::error::Tag $tag does not exist upstream."
+              exit 1
+            fi
+          else
+            # Resolve the newest upstream nightly tag without cloning the repo.
+            # Prefer peeled commit SHAs (^{}) when an annotated tag exists.
+            tag_line="$(git ls-remote --tags "https://github.com/${UPSTREAM_REPOSITORY}.git" 'refs/tags/v*-nightly.*' \
+              | awk '
+                {
+                  sha = $1
+                  ref = $2
+                  sub(/^refs\/tags\//, "", ref)
+                  if (sub(/\^\{\}$/, "", ref)) {
+                    peeled[ref] = sha
+                  } else {
+                    direct[ref] = sha
+                  }
+                  tags[ref] = 1
+                }
+                END {
+                  for (t in tags) {
+                    print (t in peeled ? peeled[t] : direct[t]) " " t
+                  }
+                }
+              ' \
+              | sed -nE 's/^([0-9a-f]+) v([0-9]+)\.([0-9]+)\.([0-9]+)-nightly\.([0-9]{8})\.([0-9]+)$/\2 \3 \4 \5 \6 \1 v\2.\3.\4-nightly.\5.\6/p' \
+              | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n \
+              | tail -n 1)"
+            tag_sha="$(awk '{print $6}' <<<"$tag_line")"
+            tag="$(awk '{print $7}' <<<"$tag_line")"
+            if [[ -z "$tag" || ! "$tag" =~ $nightly_pattern ]]; then
+              echo "::error::Could not find an upstream nightly tag (vX.Y.Z-nightly.YYYYMMDD.N)."
+              exit 1
+            fi
+          fi
+
+          echo "Latest upstream nightly: $tag ($tag_sha)"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "A release for $tag already exists. Nothing to do."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # On scheduled runs, avoid retrying the exact same failing state every
+          # 6 hours. Pushing to SYNC_BRANCH, a newer upstream tag, or a manual
+          # workflow_dispatch resumes immediately.
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            current_head="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${SYNC_BRANCH}" --jq '.object.sha' 2>/dev/null || true)"
+            if [[ -n "$current_head" ]]; then
+              conflict_marker="<!-- fork-sync:tag=${tag} head=${current_head} -->"
+              conflict_issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 --json number,title,body 2>/dev/null \
+                | jq -r --arg marker "$conflict_marker" \
+                  '[.[] | select((.title | startswith("[fork-sync]")) and ((.body // "") | contains($marker)))][0].number // empty' || true)"
+              if [[ -n "$conflict_issue" ]]; then
+                echo "Rebase conflict for $tag at $current_head is already tracked in issue #$conflict_issue. Waiting for a push to $SYNC_BRANCH, a newer upstream tag, or a manual run."
+                echo "should_build=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+
+              # If SYNC_BRANCH is already based on this tag and a run on this exact
+              # commit already failed, stop retrying on schedule. (The first build
+              # failure right after an automatic rebase has the pre-rebase head_sha,
+              # so it still gets one automatic retry for transient flakes.)
+              compare_status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${tag_sha}...${current_head}" --jq '.status' 2>/dev/null || true)"
+              if [[ "$compare_status" == "ahead" || "$compare_status" == "identical" ]]; then
+                failed_url="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/fork-nightly-windows.yml/runs?branch=${SYNC_BRANCH}&head_sha=${current_head}&status=failure&per_page=1" \
+                  --jq '.workflow_runs[0].html_url // empty' 2>/dev/null || true)"
+                if [[ -n "$failed_url" ]]; then
+                  echo "Build for $tag at $current_head already failed ($failed_url). Waiting for a push to $SYNC_BRANCH, a newer upstream tag, or a manual run."
+                  echo "should_build=false" >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+              fi
+            fi
+          fi
+
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+
       - name: Checkout
+        if: steps.precheck.outputs.should_build != 'false'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ env.SKIP_SYNC == 'true' && github.sha || env.SYNC_BRANCH }}
@@ -87,6 +193,7 @@ jobs:
       # --force replaces this fork's release tags, which point at rebased fork
       # commits, with upstream's, so describe below finds the upstream base.
       - name: Fetch upstream
+        if: steps.precheck.outputs.should_build != 'false'
         run: |
           set -euo pipefail
           git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
@@ -98,6 +205,7 @@ jobs:
 
       - name: Resolve target tag
         id: target
+        if: steps.precheck.outputs.should_build != 'false'
         run: |
           set -euo pipefail
           nightly_pattern='^v[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]{8}\.[0-9]+$'
@@ -128,7 +236,7 @@ jobs:
 
       - name: Check for an existing release
         id: release
-        if: env.SKIP_SYNC != 'true' && env.FORCE_BUILD != 'true'
+        if: env.SKIP_SYNC != 'true' && env.FORCE_BUILD != 'true' && steps.precheck.outputs.should_build != 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.target.outputs.tag }}
@@ -142,7 +250,7 @@ jobs:
           fi
 
       - name: Mirror upstream main
-        if: env.SKIP_SYNC != 'true' && steps.release.outputs.should_build != 'false'
+        if: env.SKIP_SYNC != 'true' && steps.precheck.outputs.should_build != 'false' && steps.release.outputs.should_build != 'false'
         run: |
           set -euo pipefail
           expected="$(git rev-parse -q --verify refs/remotes/origin/main || true)"
@@ -150,7 +258,7 @@ jobs:
 
       - name: Rebase fork patches
         id: rebase
-        if: env.SKIP_SYNC != 'true' && steps.release.outputs.should_build != 'false'
+        if: env.SKIP_SYNC != 'true' && steps.precheck.outputs.should_build != 'false' && steps.release.outputs.should_build != 'false'
         env:
           TAG: ${{ steps.target.outputs.tag }}
         run: |
@@ -201,7 +309,7 @@ jobs:
           exit 1
 
       - name: Push rebased branch
-        if: env.SKIP_SYNC != 'true' && steps.release.outputs.should_build != 'false'
+        if: env.SKIP_SYNC != 'true' && steps.precheck.outputs.should_build != 'false' && steps.release.outputs.should_build != 'false'
         env:
           ORIGINAL_HEAD: ${{ steps.rebase.outputs.original_head }}
         run: |
@@ -218,6 +326,7 @@ jobs:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
           TAG: ${{ steps.target.outputs.tag }}
           OLD_BASE: ${{ steps.rebase.outputs.old_base }}
+          ORIGINAL_HEAD: ${{ steps.rebase.outputs.original_head }}
           STOPPED_AT: ${{ steps.rebase.outputs.stopped_at }}
           FILES: ${{ steps.rebase.outputs.files }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -247,6 +356,8 @@ jobs:
             echo "The next scheduled run then builds $TAG. To build now, run this workflow with \`upstream_tag: $TAG\`. This issue closes on the next successful sync."
             echo
             echo "Run: $RUN_URL"
+            echo
+            echo "<!-- fork-sync:tag=$TAG head=$ORIGINAL_HEAD -->"
           } > issue.md
 
           gh label create fork-sync --repo "$GITHUB_REPOSITORY" --color B60205 \
@@ -264,7 +375,7 @@ jobs:
           fi
 
       - name: Close resolved conflict issues
-        if: env.SKIP_SYNC != 'true' && steps.release.outputs.should_build != 'false'
+        if: env.SKIP_SYNC != 'true' && steps.precheck.outputs.should_build != 'false' && steps.release.outputs.should_build != 'false'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
@@ -280,7 +391,7 @@ jobs:
 
       - name: Set outputs
         id: done
-        if: steps.release.outputs.should_build != 'false'
+        if: steps.precheck.outputs.should_build != 'false' && steps.release.outputs.should_build != 'false'
         run: |
           echo "should_build=true" >> "$GITHUB_OUTPUT"
           echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
