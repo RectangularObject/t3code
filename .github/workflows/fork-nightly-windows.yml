@@ -11,7 +11,10 @@ name: Fork nightly (Windows)
 #      force-mirrored from upstream, so this file cannot live there.
 #   2. Add a fine-grained PAT scoped to this fork as the FORK_SYNC_TOKEN secret,
 #      with Contents, Workflows, and Issues set to Read and write.
-#   3. Enable Issues on the fork so rebase conflicts can open an issue.
+#   3. Add a dedicated passphrase-less SSH private key as the
+#      FORK_SYNC_SIGNING_KEY secret and register its public key as a Signing Key
+#      on your GitHub account so rebased commits stay Verified.
+#   4. Enable Issues on the fork so rebase conflicts can open an issue.
 #
 # The file is fork-owned and edits no upstream file, so rebasing it onto a new
 # upstream nightly never conflicts.
@@ -217,8 +220,8 @@ jobs:
           git fetch --force --no-tags upstream \
             "+refs/heads/main:refs/remotes/upstream/main" \
             "+refs/tags/*:refs/tags/*"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "RectangularObject"
+          git config user.email "26125768+RectangularObject@users.noreply.github.com"
 
       - name: Resolve target tag
         id: target
@@ -284,6 +287,7 @@ jobs:
         if: env.SKIP_SYNC != 'true' && steps.precheck.outputs.should_build != 'false' && steps.release.outputs.should_build != 'false'
         env:
           TAG: ${{ steps.target.outputs.tag }}
+          FORK_SYNC_SIGNING_KEY: ${{ secrets.FORK_SYNC_SIGNING_KEY }}
         run: |
           set -euo pipefail
           original_head="$(git rev-parse HEAD)"
@@ -315,20 +319,43 @@ jobs:
             exit 0
           fi
 
-          if git rebase --onto "$target_commit" "$base_commit"; then
-            echo "Rebased $SYNC_BRANCH onto $TAG."
+          if [[ -z "$FORK_SYNC_SIGNING_KEY" ]]; then
+            echo "::error title=FORK_SYNC_SIGNING_KEY is missing::Save a passphrase-less SSH private key as the repository secret FORK_SYNC_SIGNING_KEY and register its public key as a Signing Key on your GitHub account."
+            exit 1
+          fi
+
+          key_file="${RUNNER_TEMP}/fork-sync-signing-key"
+          trap 'rm -f "$key_file"' EXIT
+          install -m 600 /dev/null "$key_file"
+          printf '%s\n' "$FORK_SYNC_SIGNING_KEY" | tr -d '\r' > "$key_file"
+
+          if ! ssh-keygen -y -P "" -f "$key_file" >/dev/null 2>&1 ||
+            ! printf 'test' | ssh-keygen -Y sign -n git -f "$key_file" >/dev/null 2>&1; then
+            echo "::error::FORK_SYNC_SIGNING_KEY is not a valid passphrase-less SSH signing key."
+            exit 1
+          fi
+
+          if git -c gpg.format=ssh -c "user.signingkey=${key_file}" -c commit.gpgsign=true \
+            rebase --onto "$target_commit" "$base_commit"; then
+            echo "Rebased and signed $SYNC_BRANCH onto $TAG."
             exit 0
           fi
 
-          {
-            echo "conflict=true"
-            echo "stopped_at=$(git log -1 --format='%h %s' REBASE_HEAD 2>/dev/null || echo unknown)"
-            echo "files<<EOF"
-            git diff --name-only --diff-filter=U
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-          git rebase --abort
-          echo "::error::Rebasing $SYNC_BRANCH onto $TAG stopped with conflicts. $SYNC_BRANCH was left unchanged."
+          unmerged="$(git diff --name-only --diff-filter=U)"
+          if [[ -n "$unmerged" ]]; then
+            {
+              echo "conflict=true"
+              echo "stopped_at=$(git log -1 --format='%h %s' REBASE_HEAD 2>/dev/null || echo unknown)"
+              echo "files<<EOF"
+              printf '%s\n' "$unmerged"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            git rebase --abort
+            echo "::error::Rebasing $SYNC_BRANCH onto $TAG stopped with conflicts. $SYNC_BRANCH was left unchanged."
+          else
+            git rebase --abort 2>/dev/null || true
+            echo "::error::Rebasing $SYNC_BRANCH onto $TAG failed (not a merge conflict). $SYNC_BRANCH was left unchanged."
+          fi
           exit 1
 
       - name: Push rebased branch
