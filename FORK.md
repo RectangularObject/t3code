@@ -4,7 +4,7 @@ This is a personal fork of [pingdotgg/t3code](https://github.com/pingdotgg/t3cod
 
 ## Active fork features
 
-- **Always-on Plan Mode (`apps/web`)**: Restores the Web/Desktop Build/Plan toggle, `Shift+Tab` shortcut, `/plan` and `/default` slash commands, and the "Plan ready" follow-up / Implement / Implement in a new thread flows removed in upstream PR #33131 — unconditionally enabled with no Labs toggle, leaving the rest of PR #33131's cleanups intact.
+- **Always-on Plan Mode (`apps/web`)**: Restores the Web/Desktop Build/Plan toggle, `Shift+Tab` shortcut, `/plan` and `/default` slash commands, and the "Plan ready" follow-up / Implement / Implement in a new thread flows removed in upstream PR #33131 — unconditionally enabled with no Labs toggle, leaving the rest of PR #33131's cleanups intact. Approving a plan in the same thread sends a concise `"Implement the plan."` follow-up instead of resending the full plan markdown (which is already in context), while **Implement in a new thread** prefixes the plan with `"Implement this plan:\n\n"` instead of `"PLEASE IMPLEMENT THIS PLAN:\n"`.
 - **Automated Windows x64 nightly sync & release (`.github/workflows/fork-nightly-windows.yml`)**: Runs every 6 hours (matching upstream's 6-hour minimum nightly gap) to rebase `fork-nightly` onto each new upstream `v*-nightly.*` tag, opens a `[fork-sync]` issue on conflict, and publishes an unsigned `win-x64` NSIS prerelease with T3 Connect enabled and `app-update.yml` pointed at this fork for in-app auto-updates.
 
 ## Branch & sync model
