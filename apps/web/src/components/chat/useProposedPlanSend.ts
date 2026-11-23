@@ -167,7 +167,6 @@ export function usePlanModeComposerSend(input: PlanModeComposerSendInput) {
     ) {
       const followUp = resolvePlanFollowUpSubmission({
         draftText: submission.promptForSend,
-        planMarkdown: activeProposedPlan.planMarkdown,
       });
       const outgoingText = formatOutgoingPrompt({
         provider: sendCtx.selectedProvider,
