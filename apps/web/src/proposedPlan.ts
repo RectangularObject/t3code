@@ -58,7 +58,9 @@ function sanitizePlanFileSegment(input: string): string {
   return sanitized.length > 0 ? sanitized : "plan";
 }
 
-export const PLAN_IMPLEMENTATION_PROMPT_PREFIX = "PLEASE IMPLEMENT THIS PLAN:\n";
+const LEGACY_PLAN_IMPLEMENTATION_PROMPT_PREFIX = "PLEASE IMPLEMENT THIS PLAN:\n";
+const NEW_THREAD_PLAN_IMPLEMENTATION_PROMPT_PREFIX = "Implement this plan:\n\n";
+const SAME_THREAD_PLAN_IMPLEMENTATION_PROMPT = "Implement the plan.";
 
 export interface LatestProposedPlanState {
   readonly id: PlanId;
@@ -119,11 +121,19 @@ export function hasActionableProposedPlan(plan: LatestProposedPlanState | null):
 }
 
 export function buildPlanImplementationPrompt(planMarkdown: string): string {
-  return `${PLAN_IMPLEMENTATION_PROMPT_PREFIX}${planMarkdown.trim()}`;
+  return `${NEW_THREAD_PLAN_IMPLEMENTATION_PROMPT_PREFIX}${planMarkdown.trim()}`;
 }
 
-/** Text in the draft refines the plan; an empty draft implements it. */
-export function resolvePlanFollowUpSubmission(input: { draftText: string; planMarkdown: string }): {
+export function isPlanImplementationPrompt(text: string): boolean {
+  return (
+    text === SAME_THREAD_PLAN_IMPLEMENTATION_PROMPT ||
+    text.startsWith(NEW_THREAD_PLAN_IMPLEMENTATION_PROMPT_PREFIX) ||
+    text.startsWith(LEGACY_PLAN_IMPLEMENTATION_PROMPT_PREFIX)
+  );
+}
+
+/** Text in the draft refines the plan; an empty draft implements it in the current thread. */
+export function resolvePlanFollowUpSubmission(input: { draftText: string }): {
   text: string;
   interactionMode: "default" | "plan";
 } {
@@ -132,7 +142,7 @@ export function resolvePlanFollowUpSubmission(input: { draftText: string; planMa
     return { text: trimmedDraftText, interactionMode: "plan" };
   }
   return {
-    text: buildPlanImplementationPrompt(input.planMarkdown),
+    text: SAME_THREAD_PLAN_IMPLEMENTATION_PROMPT,
     interactionMode: "default",
   };
 }

@@ -89,6 +89,14 @@ describe("recallableComposerPrompt", () => {
     expect(recallableComposerPrompt(sent)).toBe("Look at please\n    indented  code");
     expect(recallableComposerPrompt("![image](t3-context://v1/image/img-1)")).toBe("");
   });
+
+  it.each([
+    "Implement the plan.",
+    "Implement this plan:\n\n## Ship it",
+    "PLEASE IMPLEMENT THIS PLAN:\n## Ship it",
+  ])("skips synthetic plan implementation prompt %j", (prompt) => {
+    expect(recallableComposerPrompt(prompt)).toBe("");
+  });
 });
 
 describe("buildComposerPromptHistoryEntries", () => {

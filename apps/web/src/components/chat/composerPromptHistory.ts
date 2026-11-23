@@ -9,7 +9,7 @@ import {
   collectComposerContextReferences,
 } from "@t3tools/shared/composerContextReferences";
 import { Schema } from "effect";
-import { PLAN_IMPLEMENTATION_PROMPT_PREFIX } from "../../proposedPlan";
+import { isPlanImplementationPrompt } from "../../proposedPlan";
 
 const CLAUDE_ULTRATHINK_PREFIX = "Ultrathink:\n";
 const REVIEW_COMMENT_BLOCK_PATTERN = /<review_comment\b[^>]*>[\s\S]*?<\/review_comment>/g;
@@ -132,10 +132,7 @@ export function recallableComposerPrompt(
   }
 
   const trimmed = prompt.trim();
-  if (
-    trimmed === ATTACHMENT_ONLY_BOOTSTRAP_PROMPT ||
-    trimmed.startsWith(PLAN_IMPLEMENTATION_PROMPT_PREFIX)
-  ) {
+  if (trimmed === ATTACHMENT_ONLY_BOOTSTRAP_PROMPT || isPlanImplementationPrompt(trimmed)) {
     return "";
   }
   return trimmed;
