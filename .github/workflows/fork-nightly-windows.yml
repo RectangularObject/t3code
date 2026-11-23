@@ -178,17 +178,34 @@ jobs:
 
           echo "should_build=true" >> "$GITHUB_OUTPUT"
 
+      # Plain git checkout instead of actions/checkout: checkout's post-job
+      # credential cleanup runs `git submodule foreach`, which warns with exit
+      # code 128 on the orphaned gitlinks under upstream's vendored .repos tree.
       - name: Checkout
         if: steps.precheck.outputs.should_build != 'false'
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          ref: ${{ env.SKIP_SYNC == 'true' && github.sha || env.SYNC_BRANCH }}
-          fetch-depth: 0
-          token: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
-          sparse-checkout: |
-            /*
-            !/.repos/
-          sparse-checkout-cone-mode: false
+        env:
+          CHECKOUT_REF: ${{ env.SKIP_SYNC == 'true' && github.sha || env.SYNC_BRANCH }}
+          GIT_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          auth="$(printf 'x-access-token:%s' "$GIT_TOKEN" | base64 | tr -d '\r\n')"
+          echo "::add-mask::$auth"
+          git init -b main .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          if [[ "$SKIP_SYNC" == "true" ]]; then
+            git -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${auth}" \
+              fetch --no-tags origin "$CHECKOUT_REF"
+            git sparse-checkout set --no-cone '/*' '!/.repos/'
+            git checkout --detach FETCH_HEAD
+          else
+            git -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${auth}" \
+              fetch --no-tags origin "+refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}"
+            git -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${auth}" \
+              fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main" || true
+            git sparse-checkout set --no-cone '/*' '!/.repos/'
+            git checkout -B "$SYNC_BRANCH" "refs/remotes/origin/${SYNC_BRANCH}"
+          fi
 
       # --force replaces this fork's release tags, which point at rebased fork
       # commits, with upstream's, so describe below finds the upstream base.
@@ -251,10 +268,16 @@ jobs:
 
       - name: Mirror upstream main
         if: env.SKIP_SYNC != 'true' && steps.precheck.outputs.should_build != 'false' && steps.release.outputs.should_build != 'false'
+        env:
+          GIT_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          GIT_TERMINAL_PROMPT: "0"
         run: |
           set -euo pipefail
+          auth="$(printf 'x-access-token:%s' "$GIT_TOKEN" | base64 | tr -d '\r\n')"
+          echo "::add-mask::$auth"
           expected="$(git rev-parse -q --verify refs/remotes/origin/main || true)"
-          git push --force-with-lease="main:${expected}" origin "refs/remotes/upstream/main:refs/heads/main"
+          git -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${auth}" \
+            push --force-with-lease="main:${expected}" origin "refs/remotes/upstream/main:refs/heads/main"
 
       - name: Rebase fork patches
         id: rebase
@@ -312,13 +335,18 @@ jobs:
         if: env.SKIP_SYNC != 'true' && steps.precheck.outputs.should_build != 'false' && steps.release.outputs.should_build != 'false'
         env:
           ORIGINAL_HEAD: ${{ steps.rebase.outputs.original_head }}
+          GIT_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          GIT_TERMINAL_PROMPT: "0"
         run: |
           set -euo pipefail
           if [[ "$(git rev-parse HEAD)" == "$ORIGINAL_HEAD" ]]; then
             echo "Nothing to push."
             exit 0
           fi
-          git push --force-with-lease="${SYNC_BRANCH}:${ORIGINAL_HEAD}" origin "HEAD:refs/heads/${SYNC_BRANCH}"
+          auth="$(printf 'x-access-token:%s' "$GIT_TOKEN" | base64 | tr -d '\r\n')"
+          echo "::add-mask::$auth"
+          git -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${auth}" \
+            push --force-with-lease="${SYNC_BRANCH}:${ORIGINAL_HEAD}" origin "HEAD:refs/heads/${SYNC_BRANCH}"
 
       - name: Report rebase conflict
         if: failure() && steps.rebase.outputs.conflict == 'true'
@@ -415,14 +443,24 @@ jobs:
       T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
       RUST_TARGET: x86_64-pc-windows-msvc
     steps:
+      # Plain git checkout instead of actions/checkout: checkout's post-job
+      # credential cleanup runs `git submodule foreach`, which warns with exit
+      # code 128 on the orphaned gitlinks under upstream's vendored .repos tree.
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          ref: ${{ needs.sync.outputs.ref }}
-          sparse-checkout: |
-            /*
-            !/.repos/
-          sparse-checkout-cone-mode: false
+        env:
+          CHECKOUT_REF: ${{ needs.sync.outputs.ref }}
+          GIT_TOKEN: ${{ github.token }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          auth="$(printf 'x-access-token:%s' "$GIT_TOKEN" | base64 | tr -d '\r\n')"
+          echo "::add-mask::$auth"
+          git init -b main .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${auth}" \
+            fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
