@@ -83,13 +83,15 @@ export const WorkGroupSection = memo(function WorkGroupSection({
     onToggleWorkEntry,
     onWorkEntryContentReady,
     pendingApprovals,
+    verboseActivity,
   } = use(TimelineRowCtx);
   const gt = useGT();
   const nonEmptyEntries = groupedEntries.filter((entry) => {
     const item = entry.projectedItem?.item;
     return (
       (item?.type === "approval_request" && pendingApprovals.has(item.requestId)) ||
-      workEntryIsVisibleInGroup(entry, isExpandedToolGroup)
+      // Verbose rows were filtered when derived, running tools included.
+      workEntryIsVisibleInGroup(entry, isExpandedToolGroup || verboseActivity === true)
     );
   });
 
