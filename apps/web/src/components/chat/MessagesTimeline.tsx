@@ -146,6 +146,7 @@ import { useThreadFindPositionReader } from "./useThreadFindPositionReader";
 import { ThreadActivityAnnouncer } from "./ThreadActivityAnnouncer";
 import { useStableHandoffRuns, useIncrementalTimelineRows, useStableRows } from "./useTimelineRows";
 import { useClientSettings } from "../../hooks/useSettings";
+import { useVerboseActivity } from "../../forkVerboseActivity";
 
 function timelineListStateFor(identity: string): {
   readonly identity: string;
@@ -159,6 +160,7 @@ function timelineListStateFor(identity: string): {
     workGroupViewState: rememberedPosition?.disclosures?.workGroupState ?? {
       scrollPositions: new Map(),
       expandedEntries: new Set(),
+      collapsedThoughts: new Set(),
     },
   };
 }
@@ -445,6 +447,9 @@ const ConversationTimeline = memo(function ConversationTimeline({
   const [expandedRunIds, setExpandedRunIds] = useState<ReadonlySet<RunId>>(
     () => listState.rememberedPosition?.disclosures?.runs ?? new Set(),
   );
+  const [collapsedRunIds, setCollapsedRunIds] = useState<ReadonlySet<RunId>>(
+    () => listState.rememberedPosition?.disclosures?.collapsedRuns ?? new Set(),
+  );
   const [expandedWorkGroupIds, setExpandedWorkGroupIds] = useState<ReadonlySet<string>>(
     () => listState.rememberedPosition?.disclosures?.workGroups ?? new Set(),
   );
@@ -464,6 +469,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
   );
   const [fullscreenAppRowId, setFullscreenAppRowId] = useState<string | null>(null);
   let paintedExpandedRunIds = expandedRunIds;
+  let paintedCollapsedRunIds = collapsedRunIds;
   let paintedExpandedWorkGroupIds = expandedWorkGroupIds;
   let paintedExpandedAttemptIds = expandedAttemptIds;
   const identityChanged = listState.identity !== listIdentityKey;
@@ -484,9 +490,11 @@ const ConversationTimeline = memo(function ConversationTimeline({
     // nor when that thread comes back.
     setFullscreenAppRowId(null);
     paintedExpandedRunIds = rememberedPosition?.disclosures?.runs ?? new Set();
+    paintedCollapsedRunIds = rememberedPosition?.disclosures?.collapsedRuns ?? new Set();
     paintedExpandedWorkGroupIds = rememberedPosition?.disclosures?.workGroups ?? new Set();
     paintedExpandedAttemptIds = rememberedPosition?.disclosures?.attempts ?? new Set();
     setExpandedRunIds(paintedExpandedRunIds);
+    setCollapsedRunIds(paintedCollapsedRunIds);
     setExpandedWorkGroupIds(paintedExpandedWorkGroupIds);
     setExpandedAttemptIds(paintedExpandedAttemptIds);
   }
@@ -569,9 +577,31 @@ const ConversationTimeline = memo(function ConversationTimeline({
     list.anchorVisibleContent({ key: anchorKey });
   };
 
+  const [storedVerboseActivity] = useVerboseActivity();
+  const preferredToolCallVisibility = useClientSettings((settings) => settings.toolCallVisibility);
+  // Gated on the preference, not the effective value: find maps zen to hideAll.
+  const verboseActivity = storedVerboseActivity && preferredToolCallVisibility !== "zen";
+
   // Turn and attempt folds reveal later rows rather than growing their own row.
-  const onToggleTurnFold = (runId: RunId) => {
+  const onToggleTurnFold = (runId: RunId, expanded: boolean) => {
     preserveDisclosurePosition(`turn-fold:${runId}`);
+    if (verboseActivity) {
+      setExpandedRunIds((existing) => {
+        if (existing.has(runId) === !expanded) return existing;
+        const next = new Set(existing);
+        if (expanded) next.delete(runId);
+        else next.add(runId);
+        return next;
+      });
+      setCollapsedRunIds((existing) => {
+        if (existing.has(runId) === expanded) return existing;
+        const next = new Set(existing);
+        if (expanded) next.add(runId);
+        else next.delete(runId);
+        return next;
+      });
+      return;
+    }
     setExpandedRunIds((existing) => {
       const next = new Set(existing);
       if (next.has(runId)) {
@@ -636,7 +666,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
         if (observedLatestRun.status === "running" && latestRun.status === "interrupted") {
           setExpandedRunIds((existing) => new Set(existing).add(latestRun.runId));
         }
-      } else {
+      } else if (!verboseActivity) {
         setExpandedRunIds((existing) => {
           if (!existing.has(previousRunId)) return existing;
           const next = new Set(existing);
@@ -647,7 +677,6 @@ const ConversationTimeline = memo(function ConversationTimeline({
     }
   }
 
-  const preferredToolCallVisibility = useClientSettings((settings) => settings.toolCallVisibility);
   const screenReaderAnnouncements = useClientSettings(
     (settings) => settings.screenReaderAnnouncements,
   );
@@ -757,6 +786,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
     usageLimitRunId,
     runningRunId,
     expandedRunIds: visibleExpandedRunIds,
+    collapsedRunIds: paintedCollapsedRunIds,
     expandedAttemptIds: visibleExpandedAttemptIds,
     expandedWorkGroupIds,
     isWorking,
@@ -769,6 +799,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
     worktreeSetup,
     toolCallVisibility,
     revealedMessageId,
+    verboseActivity,
   });
   const rows = useStableRows(rawRows, listIdentityKey);
   const matchedApprovalRequestIds = new Set<string>();
@@ -1026,6 +1057,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
           atEnd: isAtEnd,
           disclosures: {
             runs: paintedExpandedRunIds,
+            collapsedRuns: paintedCollapsedRunIds,
             workGroups: paintedExpandedWorkGroupIds,
             attempts: paintedExpandedAttemptIds,
             workGroupState: workGroupViewState,
@@ -1170,6 +1202,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
     onWorktreeSetupWorkLocally: onWorktreeSetupWorkLocally ?? null,
     onOpenWorktreeSetupTerminal: onOpenWorktreeSetupTerminal ?? null,
     workGroupViewState,
+    verboseActivity,
   };
   const compactionAwaitingRow =
     isCompacting &&
@@ -1642,6 +1675,14 @@ function keyExtractor(item: MessagesTimelineRow) {
 // LegendList estimates unmeasured rows from their type's average. Long messages of equal length
 // can differ in height by orders of magnitude, so each gets its own type to avoid nested-update loops.
 function getItemType(item: MessagesTimelineRow) {
+  const thought =
+    item.kind === "work" && !item.isExpandedToolGroup && item.groupedEntries.length === 1
+      ? item.groupedEntries[0]
+      : undefined;
+  if (thought?.itemType === "reasoning") {
+    const thoughtBucket = Math.max(0, Math.floor(Math.log2((thought.detail?.length ?? 0) / 1000)));
+    return thoughtBucket < 2 ? `work:reasoning:${thoughtBucket}` : `work:reasoning:${thought.id}`;
+  }
   if (item.kind !== "message") return item.kind;
   const lengthBucket = Math.max(0, Math.floor(Math.log2(item.message.text.length / 1000)));
   return lengthBucket < 2
@@ -1886,7 +1927,7 @@ function WorkHistorySkeleton() {
 function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-fold" }> }) {
   const ctx = use(TimelineRowCtx);
   const { loading, error, toggle } = useDeferredWorkLoading(row, () =>
-    ctx.onToggleTurnFold(row.runId),
+    ctx.onToggleTurnFold(row.runId, row.expanded),
   );
 
   return (
