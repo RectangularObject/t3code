@@ -5244,3 +5244,167 @@ describe("workEntryReadOutput", () => {
     ).toBe("/workspace/t3code/src/app.ts\n~/.claude/CLAUDE.md\n~/.gitconfig");
   });
 });
+
+describe("verbose activity", () => {
+  const source = makeStreamingWorkTimelineFixture("reasoning");
+  const laterTool = (() => {
+    const tool = source.visibleTurnItems.find((row) => row.item.id === "live-work")!;
+    return {
+      ...tool,
+      position: source.visibleTurnItems.length,
+      sourceItemId: TurnItemId.make("live-later-tool"),
+      item: {
+        ...tool.item,
+        id: TurnItemId.make("live-later-tool"),
+        ordinal: 8,
+        status: "running" as const,
+        completedAt: null,
+      },
+    };
+  })();
+  const rowsInput = (
+    timelineEntries: ReadonlyArray<TimelineEntry>,
+    options: {
+      expandedRunIds?: ReadonlySet<RunId>;
+      collapsedRunIds?: ReadonlySet<RunId>;
+      toolCallVisibility?: "showAll" | "zen";
+    } = {},
+  ) => ({
+    timelineEntries,
+    latestRun: {
+      runId: source.runId,
+      status: "running" as const,
+      startedAt: source.time(5),
+      completedAt: null,
+    },
+    runningRunId: source.runId,
+    isWorking: true,
+    activeTurnStartedAt: source.time(5),
+    turnDiffSummaries: [],
+    supportsConversationRollback: true,
+    verboseActivity: true,
+    ...options,
+  });
+  const entriesFor = (visibleTurnItems: typeof source.visibleTurnItems) =>
+    deriveTimelineEntriesFromVisibleTurnItems({ visibleTurnItems, optimisticMessages: [] });
+  const workEntryIds = (rows: ReadonlyArray<MessagesTimelineRow>) =>
+    rows.flatMap((row) => (row.kind === "work" ? row.groupedEntries.map((entry) => entry.id) : []));
+
+  it("gives each live work entry its own row, the running tool included", () => {
+    const rows = deriveMessagesTimelineRows(
+      rowsInput(
+        entriesFor([
+          ...withStreamedText(
+            source.visibleTurnItems,
+            source.streamingItemId,
+            "Let me",
+            source.time(20),
+          ),
+          laterTool,
+        ]),
+      ),
+    );
+    expect(rows.some((row) => row.kind === "work-live" || row.kind === "work-toggle")).toBe(false);
+    for (const row of rows) {
+      if (row.kind === "work") expect(row.groupedEntries).toHaveLength(1);
+    }
+    expect(workEntryIds(rows)).toEqual(
+      expect.arrayContaining(["live-work", source.streamingItemId, "live-later-tool"]),
+    );
+    expect(rows.some((row) => row.kind === "thinking")).toBe(false);
+  });
+
+  it("keeps the thinking row while only a blank thought streams", () => {
+    const rows = deriveMessagesTimelineRows(rowsInput(entriesFor(source.visibleTurnItems)));
+    expect(workEntryIds(rows)).not.toContain(source.streamingItemId);
+    expect(rows.some((row) => row.kind === "thinking")).toBe(true);
+  });
+
+  it("opens finished turns unless the user collapsed them", () => {
+    const entries = entriesFor(source.visibleTurnItems);
+    const historyFold = (rows: ReadonlyArray<MessagesTimelineRow>) =>
+      rows.find((row) => row.kind === "turn-fold" && row.runId === source.historyRunId);
+
+    const open = deriveMessagesTimelineRows(rowsInput(entries));
+    expect(historyFold(open)).toMatchObject({ expanded: true });
+    expect(workEntryIds(open)).toContain("history-work");
+
+    const collapsedRunIds = new Set([source.historyRunId]);
+    const collapsed = deriveMessagesTimelineRows(rowsInput(entries, { collapsedRunIds }));
+    expect(historyFold(collapsed)).toMatchObject({ expanded: false });
+    expect(workEntryIds(collapsed)).not.toContain("history-work");
+
+    const forced = deriveMessagesTimelineRows(
+      rowsInput(entries, { collapsedRunIds, expandedRunIds: new Set([source.historyRunId]) }),
+    );
+    expect(historyFold(forced)).toMatchObject({ expanded: true });
+    expect(workEntryIds(forced)).toContain("history-work");
+  });
+
+  it("waits for a click before opening a turn whose work the server still holds", () => {
+    const deferred = source.visibleTurnItems.map((row) =>
+      row.item.id === "history-work"
+        ? {
+            ...row,
+            item: { ...row.item, deferredWork: { cursor: "cursor", itemCount: 3, lastOrdinal: 2 } },
+          }
+        : row,
+    );
+    const entries = entriesFor(deferred as typeof source.visibleTurnItems);
+    const fold = (rows: ReadonlyArray<MessagesTimelineRow>) =>
+      rows.find((row) => row.kind === "turn-fold" && row.runId === source.historyRunId);
+    expect(fold(deriveMessagesTimelineRows(rowsInput(entries)))).toMatchObject({
+      expanded: false,
+    });
+    expect(
+      fold(
+        deriveMessagesTimelineRows(
+          rowsInput(entries, { expandedRunIds: new Set([source.historyRunId]) }),
+        ),
+      ),
+    ).toMatchObject({ expanded: true });
+  });
+
+  it("changes nothing in zen", () => {
+    const entries = entriesFor(source.visibleTurnItems);
+    const zen = rowsInput(entries, { toolCallVisibility: "zen" });
+    const { verboseActivity: _verbose, ...plainZen } = zen;
+    expect(deriveMessagesTimelineRows(zen)).toEqual(deriveMessagesTimelineRows(plainZen));
+  });
+
+  it("patches streamed thinking without deriving every row again", () => {
+    let visibleTurnItems = withStreamedText(
+      [...source.visibleTurnItems, laterTool],
+      source.streamingItemId,
+      "Let",
+      source.time(20),
+    );
+    let timeline = deriveTimelineEntriesFromVisibleTurnItemsWithState({
+      visibleTurnItems,
+      optimisticMessages: [],
+    });
+    let projection = deriveMessagesTimelineRowsWithState(rowsInput(timeline.entries));
+    for (const [step, text] of ["Let me", "Let me check the tests"].entries()) {
+      visibleTurnItems = withStreamedText(
+        visibleTurnItems,
+        source.streamingItemId,
+        text,
+        source.time(21 + step),
+      );
+      const timelineInput = { visibleTurnItems, optimisticMessages: [] };
+      const previous = projection;
+      timeline = deriveTimelineEntriesFromVisibleTurnItemsWithState(timelineInput, timeline);
+      projection = deriveMessagesTimelineRowsWithState(rowsInput(timeline.entries), previous);
+      expect(projection.rows).toEqual(
+        deriveMessagesTimelineRows(rowsInput(entriesFor(visibleTurnItems))),
+      );
+      for (const [index, row] of previous.rows.entries()) {
+        const holdsItem =
+          row.kind === "work" &&
+          row.groupedEntries.some((entry) => entry.id === source.streamingItemId);
+        if (holdsItem) expect(projection.rows[index]).not.toBe(row);
+        else expect(projection.rows[index]).toBe(row);
+      }
+    }
+  });
+});
