@@ -200,13 +200,19 @@ const toolCallExpandedBodyClassName =
 
 const stopRowToggle = (e: { stopPropagation: () => void }) => e.stopPropagation();
 
-export function ReasoningTraceContent({ entries }: { entries: ReadonlyArray<TimelineWorkEntry> }) {
+export function ReasoningTraceContent({
+  entries,
+  uncapped = false,
+}: {
+  entries: ReadonlyArray<TimelineWorkEntry>;
+  uncapped?: boolean;
+}) {
   const ctx = use(TimelineRowCtx);
   const { isWorking, latestRunId } = use(TimelineRowActivityCtx);
   const isStreaming = (entry: TimelineWorkEntry) =>
     isWorking && entry.runId === latestRunId && entry.toolLifecycleStatus === "inProgress";
   return (
-    <WorkLogDetails followLive={entries.some(isStreaming)}>
+    <WorkLogDetails uncapped={uncapped} followLive={!uncapped && entries.some(isStreaming)}>
       {entries.map((entry) => (
         <ChatMarkdown
           key={entry.id}
@@ -305,8 +311,18 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
       ? notificationChildThreadId(workEntry.projectedItem.item.source)
       : undefined;
   const groupView = use(WorkGroupViewCtx);
-  const [expanded, setExpanded] = useState(
-    () => groupView?.state.expandedEntries.has(workEntry.id) ?? false,
+  const isReasoning = workEntry.itemType === "reasoning";
+  // Verbose rows stand alone, outside any group view, so they keep their disclosure in the
+  // thread's view state to survive virtualization remounts. Thoughts start open there.
+  const verboseView =
+    groupView === null && ctx.verboseActivity === true ? ctx.workGroupViewState : null;
+  const verboseThought = verboseView !== null && isReasoning;
+  const [expanded, setExpanded] = useState(() =>
+    verboseView
+      ? verboseThought
+        ? !verboseView.collapsedThoughts.has(workEntry.id)
+        : verboseView.expandedEntries.has(workEntry.id)
+      : (groupView?.state.expandedEntries.has(workEntry.id) ?? false),
   );
   const noticeMessage =
     workEntry.structuredPayload?.type === "system_notice"
@@ -333,6 +349,13 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
       if (next) groupView.state.expandedEntries.add(workEntry.id);
       else groupView.state.expandedEntries.delete(workEntry.id);
     } else {
+      if (verboseView && isReasoning) {
+        if (next) verboseView.collapsedThoughts.delete(workEntry.id);
+        else verboseView.collapsedThoughts.add(workEntry.id);
+      } else if (verboseView) {
+        if (next) verboseView.expandedEntries.add(workEntry.id);
+        else verboseView.expandedEntries.delete(workEntry.id);
+      }
       props.onToggleEntry?.(!next);
     }
     setExpanded(next);
@@ -436,7 +459,6 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
     showWarningIndicator || showDestructiveRowStyle
       ? undefined
       : (workEntry.toolIcon ?? workEntry.toolSource?.icon);
-  const isReasoning = workEntry.itemType === "reasoning";
   const questionHeading = workEntry.questionAnswer
     ? getQuestionTextPreview(workEntry.questionAnswer)
     : "";
@@ -715,7 +737,9 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
       {expanded && workEntry.questionAnswer ? (
         <QuestionAnswerHistory answer={workEntry.questionAnswer} />
       ) : null}
-      {expanded && isReasoning ? <ReasoningTraceContent entries={[workEntry]} /> : null}
+      {expanded && isReasoning ? (
+        <ReasoningTraceContent entries={[workEntry]} uncapped={verboseThought} />
+      ) : null}
       {expanded &&
       !isReasoning &&
       !workEntry.questionAnswer &&
