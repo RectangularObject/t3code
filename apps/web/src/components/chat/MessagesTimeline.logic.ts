@@ -1650,9 +1650,14 @@ export function deriveMessagesTimelineRows(
     worktreeSetup?: WorktreeSetupSnapshot | null;
     toolCallVisibility?: ToolCallVisibility;
     revealedMessageId?: MessageId | null;
+    /** Fork: one row per work entry, and finished turns open unless collapsed. */
+    verboseActivity?: boolean;
+    /** Verbose mode only: runs the user folded. */
+    collapsedRunIds?: ReadonlySet<RunId>;
   },
   resolve: MessageResolver = m,
 ): MessagesTimelineRow[] {
+  const verboseActivity = input.verboseActivity === true && input.toolCallVisibility !== "zen";
   const timelineEntries = timelineRowEntries(input);
   const embeddedResultRunIds = new Set<RunId>();
   for (const entry of timelineEntries) {
@@ -1716,10 +1721,29 @@ export function deriveMessagesTimelineRows(
           resolve,
         });
   const timelineEntryById = new Map(timelineEntries.map((entry) => [entry.id, entry]));
+  const foldDeferredWorkItemIds = (fold: TurnFold) =>
+    [...fold.entryIds].flatMap((entryId) => {
+      const entry = timelineEntryById.get(entryId);
+      return entry?.kind === "work" &&
+        entry.entry.projectedItem?.item.deferredWork &&
+        !supersededWorkItemIds.has(String(entry.entry.projectedItem.sourceItemId))
+        ? [String(entry.entry.projectedItem.sourceItemId)]
+        : [];
+    });
+  const deferredWorkItemIdsByRunId = new Map(
+    [...foldsByAnchorEntryId.values()].map((fold) => [fold.runId, foldDeferredWorkItemIds(fold)]),
+  );
+  // Verbose folds start open, except ones whose history the server still holds: opening
+  // those loads it, so they wait for a click.
+  const turnFoldCollapsed = (runId: RunId) =>
+    !input.expandedRunIds?.has(runId) &&
+    (!verboseActivity ||
+      input.collapsedRunIds?.has(runId) === true ||
+      (deferredWorkItemIdsByRunId.get(runId)?.length ?? 0) > 0);
   const collapsedEntryIds = new Set<string>();
   const collapsedFoldMemberIds = new Set<string>();
   for (const fold of foldsByAnchorEntryId.values()) {
-    if (!input.expandedRunIds?.has(fold.runId)) {
+    if (turnFoldCollapsed(fold.runId)) {
       for (const entryId of fold.hiddenEntryIds) {
         collapsedEntryIds.add(entryId);
       }
@@ -1756,7 +1780,7 @@ export function deriveMessagesTimelineRows(
     : timelineEntries.length;
 
   const activeToolEntries: Array<Extract<TimelineEntry, { kind: "work" }>> = [];
-  if (input.isWorking && (unsettledRunId !== null || runlessWorkActive)) {
+  if (!verboseActivity && input.isWorking && (unsettledRunId !== null || runlessWorkActive)) {
     let tailAttemptId: string | null | undefined;
     for (let index = timelineEntries.length - 1; index >= activeTurnHeaderIndex; index -= 1) {
       const entry = timelineEntries[index]!;
@@ -1976,14 +2000,7 @@ export function deriveMessagesTimelineRows(
 
     const turnFold = foldsByAnchorEntryId.get(timelineEntry.id);
     if (turnFold) {
-      const deferredWorkItemIds = [...turnFold.entryIds].flatMap((entryId) => {
-        const entry = timelineEntryById.get(entryId);
-        return entry?.kind === "work" &&
-          entry.entry.projectedItem?.item.deferredWork &&
-          !supersededWorkItemIds.has(String(entry.entry.projectedItem.sourceItemId))
-          ? [String(entry.entry.projectedItem.sourceItemId)]
-          : [];
-      });
+      const deferredWorkItemIds = deferredWorkItemIdsByRunId.get(turnFold.runId) ?? [];
       nextRows.push({
         kind: "turn-fold",
         id: `turn-fold:${turnFold.runId}`,
@@ -1991,7 +2008,7 @@ export function deriveMessagesTimelineRows(
         createdAt: turnFold.createdAt,
         runId: turnFold.runId,
         label: turnFold.label,
-        expanded: input.expandedRunIds?.has(turnFold.runId) ?? false,
+        expanded: !turnFoldCollapsed(turnFold.runId),
       });
     }
 
@@ -2092,6 +2109,24 @@ export function deriveMessagesTimelineRows(
           groupedEntries: [timelineEntry.entry],
           isExpandedToolGroup: false,
         });
+        continue;
+      }
+      if (verboseActivity) {
+        const entry = timelineEntry.entry;
+        const active = workEntryIsInActiveRun(entry);
+        if (!workEntryIsVisibleInGroup(entry, active)) continue;
+        nextRows.push({
+          kind: "work",
+          id: timelineEntry.id,
+          createdAt: timelineEntry.createdAt,
+          groupedEntries: [entry],
+          isExpandedToolGroup: false,
+        });
+        // A running tool is the live activity; between tools the thinking row stays.
+        if (active && entry.itemType !== "reasoning") hasActivityRow = true;
+        nextRows.push(
+          ...viewedImagesRows(workGroupId(timelineEntry.id), timelineEntry.createdAt, [entry]),
+        );
         continue;
       }
       const groupedEntries = [timelineEntry.entry];
@@ -2586,6 +2621,7 @@ function replaceStreamingMessageRows(
     latestRun: previousRun,
     turnDiffSummaries: previousCheckpoints,
     expandedRunIds: previousExpandedRuns,
+    collapsedRunIds: previousCollapsedRuns,
     expandedAttemptIds: previousExpandedAttempts,
     expandedWorkGroupIds: previousExpandedGroups,
     pendingApprovalRequestIds: previousPendingApprovalRequestIds,
@@ -2597,6 +2633,7 @@ function replaceStreamingMessageRows(
     latestRun,
     turnDiffSummaries,
     expandedRunIds,
+    collapsedRunIds,
     expandedAttemptIds,
     expandedWorkGroupIds,
     pendingApprovalRequestIds,
@@ -2609,6 +2646,7 @@ function replaceStreamingMessageRows(
     !shallow(previousContext, context) ||
     !shallow(previousRun, latestRun) ||
     !shallow(previousExpandedRuns, expandedRunIds) ||
+    !shallow(previousCollapsedRuns, collapsedRunIds) ||
     !shallow(previousExpandedAttempts, expandedAttemptIds) ||
     !shallow(previousExpandedGroups, expandedWorkGroupIds) ||
     !shallow(previousPendingApprovalRequestIds, pendingApprovalRequestIds) ||
@@ -2707,7 +2745,18 @@ function replaceStreamingMessageRows(
     }
     if (row.kind === "work") {
       const groupedEntries = patchGroup(row.groupedEntries);
-      return groupedEntries === row.groupedEntries ? row : { ...row, groupedEntries };
+      if (groupedEntries === row.groupedEntries) return row;
+      // Verbose rows show a single thought's text as is, with no label derived from it.
+      if (
+        input.verboseActivity === true &&
+        input.toolCallVisibility !== "zen" &&
+        groupedEntries.length === 1 &&
+        row.displayLabel === undefined &&
+        !row.isExpandedToolGroup
+      ) {
+        patchedLiveThoughtIds.add(groupedEntries[0]!.id);
+      }
+      return { ...row, groupedEntries };
     }
     if (row.kind !== "message" && row.kind !== "assistant-meta") return row;
     const entry = replacements.get(row.message);

@@ -532,6 +532,14 @@ export const SETTINGS_SEARCH_ITEMS = [
     ],
   },
   {
+    id: "verbose-activity",
+    title: msg("Expanded activity log"),
+    to: "/settings/chat",
+    searchTerms: [
+      msg("verbose thinking reasoning thoughts expand tool calls cli terminal work log activity"),
+    ],
+  },
+  {
     id: "screen-reader-announcements",
     title: msg("Screen reader announcements"),
     to: "/settings/chat",
